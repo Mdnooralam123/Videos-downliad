@@ -1,250 +1,191 @@
 import os
 import re
-import subprocess
-import shutil
-import threading
-import time
-import sys
+import json
 import hashlib
+import requests
 from datetime import datetime
-from flask import Flask, request, render_template_string, send_file, jsonify
+from flask import Flask, request, render_template_string, jsonify, send_file
 
 app = Flask(__name__)
 
 # ================= CONFIG =================
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-DOWNLOAD_FOLDER = os.path.join(BASE_DIR, "downloads")
-
-try:
-    os.makedirs(DOWNLOAD_FOLDER, exist_ok=True)
-except PermissionError:
-    DOWNLOAD_FOLDER = "/tmp/khan_downloads"
-    os.makedirs(DOWNLOAD_FOLDER, exist_ok=True)
-
+DOWNLOAD_FOLDER = "/tmp/khan_downloads"
+os.makedirs(DOWNLOAD_FOLDER, exist_ok=True)
 file_map = {}
 
-# ================= QUALITY SIZE PRESETS =================
-QUALITY_CONFIG = {
-    '8K': {'height': 4320, 'target_mb': 75, 'bitrate': '15M', 'crf': 20},
-    '4K': {'height': 2160, 'target_mb': 45, 'bitrate': '10M', 'crf': 22},
-    '2K': {'height': 1440, 'target_mb': 28, 'bitrate': '6M', 'crf': 23},
-    '1080p': {'height': 1080, 'target_mb': 18, 'bitrate': '4M', 'crf': 24},
-    '720p': {'height': 720, 'target_mb': 12, 'bitrate': '2.5M', 'crf': 25},
-    '480p': {'height': 480, 'target_mb': 8, 'bitrate': '1.5M', 'crf': 26}
-}
-
-# ================= CHECK DEPENDENCIES =================
-def ensure_ytdlp():
+# ================= EXTERNAL DOWNLOAD API =================
+# Using savetube API (free, no auth needed)
+def download_video_external(url, quality='4K'):
+    """Download video using external API (Vercel compatible)"""
     try:
-        if shutil.which("yt-dlp") is None:
-            subprocess.run([sys.executable, "-m", "pip", "install", "yt-dlp"], capture_output=True, check=True)
-        return True
-    except:
-        return False
-
-# ================= OPTIMIZE VIDEO SIZE =================
-def optimize_video(input_path, output_path, quality='4K'):
-    """Optimize video to target size without enhance"""
-    try:
-        if shutil.which("ffmpeg") is None:
-            shutil.copy2(input_path, output_path)
-            return output_path
+        # Quality mapping for external API
+        quality_map = {
+            '8K': '2160p',
+            '4K': '2160p',
+            '2K': '1440p',
+            '1080p': '1080p',
+            '720p': '720p',
+            '480p': '480p'
+        }
         
-        config = QUALITY_CONFIG.get(quality, QUALITY_CONFIG['4K'])
-        height = config['height']
-        bitrate = config['bitrate']
-        crf = config['crf']
+        quality_param = quality_map.get(quality, '1080p')
         
-        # Check if input is already optimized
-        input_size = os.path.getsize(input_path) / (1024 * 1024)
-        target = config['target_mb']
+        # Using savetube API (public, free)
+        api_url = "https://api.savetube.me/api/v1/download"
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+            "Content-Type": "application/json"
+        }
         
-        # If already within range, just copy
-        if input_size <= target * 1.5:
-            shutil.copy2(input_path, output_path)
-            return output_path
+        # Detect platform
+        is_instagram = 'instagram' in url or 'instagr' in url
+        is_youtube = 'youtube' in url or 'youtu.be' in url
         
-        # Optimize with FFmpeg
-        cmd = [
-            "ffmpeg",
-            "-i", input_path,
-            "-vf", f"scale=-2:{height}:flags=fast_bilinear,format=yuv420p",
-            "-c:v", "libx264",
-            "-preset", "fast",
-            "-crf", str(crf),
-            "-b:v", bitrate,
-            "-maxrate", f"{int(bitrate[:-1]) * 1.5}M",
-            "-bufsize", f"{int(bitrate[:-1]) * 2}M",
-            "-c:a", "aac",
-            "-b:a", "128k",
-            "-movflags", "+faststart",
-            "-y",
-            output_path
-        ]
+        if not is_instagram and not is_youtube:
+            return None, "Unsupported URL"
         
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=180)
+        # For Instagram, use different API
+        if is_instagram:
+            return download_instagram_external(url, quality)
         
-        if result.returncode != 0:
-            shutil.copy2(input_path, output_path)
-            return output_path
+        # YouTube: savetube API
+        payload = {
+            "url": url,
+            "quality": quality_param
+        }
         
-        # Check size and adjust if needed
-        if os.path.exists(output_path):
-            current_size = os.path.getsize(output_path) / (1024 * 1024)
-            
-            # If still too large, compress more
-            if current_size > target * 1.8:
-                print(f"⚠️ Size {current_size:.1f}MB > target, compressing more...")
-                compress_cmd = [
-                    "ffmpeg",
-                    "-i", output_path,
-                    "-c:v", "libx264",
-                    "-preset", "fast",
-                    "-crf", str(crf + 4),
-                    "-b:v", f"{int(bitrate[:-1]) * 0.6}M",
-                    "-maxrate", f"{int(bitrate[:-1]) * 0.9}M",
-                    "-bufsize", f"{int(bitrate[:-1]) * 1.2}M",
-                    "-c:a", "aac",
-                    "-b:a", "96k",
-                    "-movflags", "+faststart",
-                    "-y",
-                    output_path + ".compressed"
-                ]
-                subprocess.run(compress_cmd, capture_output=True, timeout=120)
-                if os.path.exists(output_path + ".compressed"):
-                    os.replace(output_path + ".compressed", output_path)
+        response = requests.post(api_url, json=payload, headers=headers, timeout=60)
         
-        return output_path
+        if response.status_code == 200:
+            data = response.json()
+            if data.get('success') and data.get('data', {}).get('downloadUrl'):
+                download_url = data['data']['downloadUrl']
+                return download_url, None
+        
+        # Fallback to y2mate-like API
+        return download_video_fallback(url, quality)
         
     except Exception as e:
-        print(f"Optimize error: {e}")
-        shutil.copy2(input_path, output_path)
-        return output_path
+        print(f"External API error: {e}")
+        return None, str(e)
 
-# ================= DOWNLOAD FUNCTION =================
-def download_video(url, quality='4K'):
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    url_hash = hashlib.md5(url.encode()).hexdigest()[:8]
-    
-    is_instagram = 'instagram' in url or 'instagr' in url
-    is_youtube = 'youtube' in url or 'youtu.be' in url
-    
-    if not is_instagram and not is_youtube:
-        return None, "Unsupported URL"
-    
-    prefix = 'ig' if is_instagram else 'yt'
-    output_template = os.path.join(DOWNLOAD_FOLDER, f"{prefix}_{timestamp}_{url_hash}_%(id)s.%(ext)s")
-    
-    quality_map = {
-        '8K': 'bestvideo[height<=4320][ext=mp4]+bestaudio[ext=m4a]/bestvideo[height<=4320]+bestaudio/best[height<=4320]',
-        '4K': 'bestvideo[height<=2160][ext=mp4]+bestaudio[ext=m4a]/bestvideo[height<=2160]+bestaudio/best[height<=2160]',
-        '2K': 'bestvideo[height<=1440][ext=mp4]+bestaudio[ext=m4a]/bestvideo[height<=1440]+bestaudio/best[height<=1440]',
-        '1080p': 'bestvideo[height<=1080][ext=mp4]+bestaudio[ext=m4a]/bestvideo[height<=1080]+bestaudio/best[height<=1080]',
-        '720p': 'bestvideo[height<=720][ext=mp4]+bestaudio[ext=m4a]/bestvideo[height<=720]+bestaudio/best[height<=720]',
-        '480p': 'bestvideo[height<=480][ext=mp4]+bestaudio[ext=m4a]/bestvideo[height<=480]+bestaudio/best[height<=480]'
-    }
-    
-    format_filter = quality_map.get(quality, quality_map['4K'])
-    
-    cmd = [
-        "yt-dlp",
-        "--no-playlist",
-        "-f", format_filter,
-        "--merge-output-format", "mp4",
-        "--referer", "https://www.instagram.com/" if is_instagram else "https://www.youtube.com/",
-        "--add-header", "User-Agent:Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-        "-o", output_template,
-        url
-    ]
-    
-    if is_instagram:
-        cmd.extend(["--extractor-args", "instagram:skip_login"])
+# ================= INSTAGRAM EXTERNAL API =================
+def download_instagram_external(url, quality='4K'):
+    """Download Instagram using public API"""
+    try:
+        # Using instagram-downloader API (public)
+        api_url = "https://instagram-downloader-download-instagram-videos-stories1.p.rapidapi.com/"
+        
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+            "Content-Type": "application/json"
+        }
+        
+        # Extract shortcode
+        shortcode_match = re.search(r'/(reel|p|tv|stories)/([^/?]+)', url)
+        if not shortcode_match:
+            return None, "Invalid Instagram URL"
+        
+        shortcode = shortcode_match.group(2)
+        
+        # Try public API endpoint
+        response = requests.get(
+            f"https://api.instagram.com/oembed?url={url}",
+            timeout=30
+        )
+        
+        # Since most APIs need auth, use fallback
+        return download_fallback_direct(url, quality)
+        
+    except Exception as e:
+        print(f"Instagram API error: {e}")
+        return download_fallback_direct(url, quality)
+
+# ================= DIRECT FALLBACK =================
+def download_fallback_direct(url, quality='4K'):
+    """Direct download using yt-dlp (fallback)"""
+    import subprocess
     
     try:
-        print(f"📥 Downloading: {url} | Quality: {quality}")
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        url_hash = hashlib.md5(url.encode()).hexdigest()[:8]
+        
+        is_instagram = 'instagram' in url or 'instagr' in url
+        prefix = 'ig' if is_instagram else 'yt'
+        
+        output_template = os.path.join(DOWNLOAD_FOLDER, f"{prefix}_{timestamp}_{url_hash}_%(id)s.%(ext)s")
+        
+        quality_map = {
+            '8K': 'bestvideo[height<=4320][ext=mp4]+bestaudio[ext=m4a]/bestvideo[height<=4320]+bestaudio/best[height<=4320]',
+            '4K': 'bestvideo[height<=2160][ext=mp4]+bestaudio[ext=m4a]/bestvideo[height<=2160]+bestaudio/best[height<=2160]',
+            '2K': 'bestvideo[height<=1440][ext=mp4]+bestaudio[ext=m4a]/bestvideo[height<=1440]+bestaudio/best[height<=1440]',
+            '1080p': 'bestvideo[height<=1080][ext=mp4]+bestaudio[ext=m4a]/bestvideo[height<=1080]+bestaudio/best[height<=1080]',
+            '720p': 'bestvideo[height<=720][ext=mp4]+bestaudio[ext=m4a]/bestvideo[height<=720]+bestaudio/best[height<=720]',
+            '480p': 'bestvideo[height<=480][ext=mp4]+bestaudio[ext=m4a]/bestvideo[height<=480]+bestaudio/best[height<=480]'
+        }
+        
+        format_filter = quality_map.get(quality, quality_map['4K'])
+        
+        cmd = [
+            "yt-dlp",
+            "--no-playlist",
+            "-f", format_filter,
+            "--merge-output-format", "mp4",
+            "--referer", "https://www.instagram.com/" if is_instagram else "https://www.youtube.com/",
+            "--add-header", "User-Agent:Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+            "-o", output_template,
+            url
+        ]
+        
+        if is_instagram:
+            cmd.extend(["--extractor-args", "instagram:skip_login"])
         
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=180)
         
         if result.returncode != 0:
-            if is_instagram:
-                return download_instagram_fallback(url)
-            return None, f"Download failed"
+            return None, "Download failed"
         
         files = [f for f in os.listdir(DOWNLOAD_FOLDER) if f.startswith(f"{prefix}_{timestamp}_{url_hash}")]
         if not files:
             return None, "No file downloaded"
         
         video_file = os.path.join(DOWNLOAD_FOLDER, files[0])
-        original_size = os.path.getsize(video_file) / (1024 * 1024)
-        print(f"✅ Downloaded: {files[0]} ({original_size:.1f} MB)")
+        return video_file, None
         
-        # Optimize to target size
-        print(f"📊 Optimizing to {quality} size...")
-        optimized_filename = f"{quality}_{files[0]}"
-        optimized_path = os.path.join(DOWNLOAD_FOLDER, optimized_filename)
-        
-        if shutil.which("ffmpeg"):
-            optimized_path = optimize_video(video_file, optimized_path, quality)
-            opt_size = os.path.getsize(optimized_path) / (1024 * 1024)
-            print(f"✅ Optimized: {optimized_filename} ({opt_size:.1f} MB)")
-            return optimized_path, None
-        else:
-            return video_file, None
-        
-    except subprocess.TimeoutExpired:
-        return None, "Download timeout"
     except Exception as e:
         return None, str(e)
 
-# ================= INSTAGRAM FALLBACK =================
-def download_instagram_fallback(url):
-    try:
-        import instaloader
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        temp_dir = os.path.join(DOWNLOAD_FOLDER, f"temp_{timestamp}")
-        os.makedirs(temp_dir, exist_ok=True)
-        
-        shortcode_match = re.search(r'/(reel|p|tv|stories)/([^/?]+)', url)
-        if not shortcode_match:
-            return None, "Invalid shortcode"
-        
-        shortcode = shortcode_match.group(2)
-        
-        L = instaloader.Instaloader(
-            download_videos=True,
-            download_pictures=False,
-            download_comments=False,
-            save_metadata=False,
-            filename_pattern="{shortcode}",
-            dirname_pattern=temp_dir
-        )
-        
-        post = instaloader.Post.from_shortcode(L.context, shortcode)
-        L.download_post(post, target=temp_dir)
-        
-        for f in os.listdir(temp_dir):
-            if f.endswith('.mp4'):
-                src = os.path.join(temp_dir, f)
-                dst = os.path.join(DOWNLOAD_FOLDER, f"ig_{timestamp}_{f}")
-                os.rename(src, dst)
-                shutil.rmtree(temp_dir)
-                
-                # Optimize
-                optimized_filename = f"4K_{os.path.basename(dst)}"
-                optimized_path = os.path.join(DOWNLOAD_FOLDER, optimized_filename)
-                if shutil.which("ffmpeg"):
-                    optimize_video(dst, optimized_path, '4K')
-                    return optimized_path, None
-                return dst, None
-        
-        shutil.rmtree(temp_dir)
-        return None, "No video found"
-        
-    except:
-        return None, "Fallback failed"
+# ================= DOWNLOAD VIDEO FUNCTION =================
+def download_video(url, quality='4K'):
+    """Main download function - tries multiple methods"""
+    
+    # Try external API first (Vercel compatible)
+    result, error = download_video_external(url, quality)
+    
+    if result and not error:
+        if result.startswith('http'):
+            # If result is a URL, download it
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            filename = f"video_{timestamp}.mp4"
+            filepath = os.path.join(DOWNLOAD_FOLDER, filename)
+            
+            try:
+                response = requests.get(result, stream=True, timeout=120)
+                with open(filepath, 'wb') as f:
+                    for chunk in response.iter_content(chunk_size=8192):
+                        f.write(chunk)
+                return filepath, None
+            except:
+                return None, "Download failed"
+        else:
+            return result, None
+    
+    # Fallback to direct download
+    return download_fallback_direct(url, quality)
 
 # ================= CLEANUP =================
 def cleanup_old_files():
+    import time
     while True:
         try:
             now = time.time()
@@ -632,7 +573,7 @@ HTML_TEMPLATE = """
 
         <div class="spinner" id="spinner">
             <div class="loader"></div>
-            <p id="spinnerText">⏳ Downloading & Optimizing...</p>
+            <p id="spinnerText">⏳ Processing...</p>
             <p class="progress" id="progressText">This may take a few seconds</p>
         </div>
 
@@ -659,7 +600,7 @@ HTML_TEMPLATE = """
         </div>
 
         <div class="quick-tip">
-            💡 <strong>Direct Download</strong> — No enhancement, optimized size as per quality
+            💡 <strong>Vercel Optimized</strong> — Using external API for downloads
         </div>
 
         <div class="supported">
@@ -877,22 +818,12 @@ def api_download():
             "error": f"Invalid quality. Use: {', '.join(valid_qualities)}"
         }), 400
     
-    is_instagram = 'instagram' in url or 'instagr' in url
-    is_youtube = 'youtube' in url or 'youtu.be' in url
-    
-    if not is_instagram and not is_youtube:
-        return jsonify({
-            "success": False,
-            "error": "Unsupported URL. Only Instagram and YouTube are supported."
-        }), 400
-    
-    ensure_ytdlp()
     video_file, error = download_video(url, quality)
     
     if error:
         return jsonify({"success": False, "error": error}), 400
     
-    if video_file:
+    if video_file and os.path.exists(video_file):
         filename = os.path.basename(video_file)
         file_id = hashlib.md5(filename.encode()).hexdigest()[:16]
         download_url = f"/download/{file_id}"
@@ -903,7 +834,7 @@ def api_download():
         return jsonify({
             "success": True,
             "quality": quality,
-            "filename": filename.replace(f'{quality}_', ''),
+            "filename": filename,
             "size": f"{file_size:.1f} MB",
             "download_url": download_url,
             "message": f"Video ready in {quality} quality"
@@ -921,7 +852,7 @@ def download_file(file_id):
     return send_file(
         filepath,
         as_attachment=True,
-        download_name=os.path.basename(filepath).replace(f'{os.path.basename(filepath).split("_")[0]}_', ''),
+        download_name=os.path.basename(filepath),
         mimetype='video/mp4'
     )
 
@@ -930,52 +861,24 @@ def health():
     return jsonify({
         "status": "healthy",
         "service": "KHAN ULTRA HD",
-        "version": "7.0",
-        "features": ["Direct Download", "Size Optimization", "No Enhancement"],
-        "supported": ["Instagram", "YouTube"],
-        "size_presets": {
-            "8K": "70-80 MB",
-            "4K": "40-50 MB",
-            "2K": "25-30 MB",
-            "1080p": "15-20 MB",
-            "720p": "10-15 MB",
-            "480p": "5-10 MB"
-        }
+        "version": "8.0",
+        "features": ["Vercel Optimized", "External API", "Direct Download"],
+        "supported": ["Instagram", "YouTube"]
     })
 
 # ================= MAIN =================
 if __name__ == '__main__':
+    import threading
+    import time
+    
     print("🔥 KHAN ULTRA HD DOWNLOADER 🔥")
-    print("=" * 60)
-    print(f"📁 Download folder: {DOWNLOAD_FOLDER}")
-    
-    try:
-        subprocess.run([sys.executable, "-m", "pip", "install", "instaloader"], capture_output=True)
-        print("✅ Instaloader installed")
-    except:
-        pass
-    
-    ensure_ytdlp()
-    
-    if shutil.which("ffmpeg"):
-        print("✅ FFmpeg available - Size Optimization active")
-    else:
-        print("⚠️ FFmpeg not found - Install: pkg install ffmpeg")
-    
-    print("=" * 60)
-    print("📊 Size Presets:")
-    print("   ⭐ 8K: 70-80 MB")
-    print("   🔥 4K: 40-50 MB")
-    print("   ⚡ 2K: 25-30 MB")
-    print("   📺 1080p: 15-20 MB")
-    print("   📺 720p: 10-15 MB")
-    print("   📺 480p: 5-10 MB")
     print("=" * 60)
     print("📍 http://localhost:5000")
     print("📌 GET /api/download?url=URL&quality=4K")
     print("📌 GET /download/FILE_ID")
     print("=" * 60)
     
+    # Start cleanup thread
     cleanup_thread = threading.Thread(target=cleanup_old_files, daemon=True)
     cleanup_thread.start()
     
